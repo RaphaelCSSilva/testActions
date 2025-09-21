@@ -6,8 +6,8 @@ on:
 
 permissions:
   contents: read
-  issues: write         # needed to post a comment
-  pull-requests: write  # replies on PRs
+  issues: write         # needed to post a comment on Issues
+  pull-requests: write  # needed to post a comment on PRs
   models: read          # required by actions/ai-inference
 
 jobs:
@@ -20,7 +20,7 @@ jobs:
         id: ai
         uses: actions/ai-inference@v2
         with:
-          # Default model is openai/gpt-4o; override via 'model:' if you like
+          # Optional: pin a model (default is openai/gpt-4o)
           # model: openai/gpt-4o-mini
           system-prompt: >
             You are a precise sentiment analyst and helpful maintainer assistant.
@@ -42,27 +42,36 @@ jobs:
             Remember: JSON only, no markdown, no extra text.
           max-tokens: 250
 
-      - name: Parse AI response
+      - name: Parse AI response (from action-provided file)
         id: parse
+        shell: bash
         run: |
-          echo '${{ steps.ai.outputs.response }}' > ai.json
-          # Extract fields safely
+          set -euo pipefail
+          # Validate and normalize the JSON using jq
+          jq -e . '${{ steps.ai.outputs.response-file }}' > ai.json
+
           sentiment=$(jq -r '.sentiment // "neutral"' ai.json)
           reply=$(jq -r '.reply // ""' ai.json)
-          echo "sentiment=$sentiment" >> "$GITHUB_OUTPUT"
-          echo "reply<<EOF" >> "$GITHUB_OUTPUT"
-          echo "$reply" >> "$GITHUB_OUTPUT"
-          echo "EOF" >> "$GITHUB_OUTPUT"
+
+          {
+            echo "sentiment=$sentiment"
+            echo "reply<<EOF"
+            echo "$reply"
+            echo "EOF"
+          } >> "$GITHUB_OUTPUT"
 
       - name: Post reply
         uses: actions/github-script@v7
         with:
-            script: |
-              const issue_number = context.payload.issue.number;
-              const body = `**Sentiment:** \`${{ steps.parse.outputs.sentiment }}\`\n\n${{ toJSON(steps.parse.outputs.reply) }}`;
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number,
-                body
-              });
+          script: |
+            const issue_number = context.payload.issue.number;
+            // reply may include newlines; use toJSON to keep formatting safe
+            const sentiment = `${{ toJSON(steps.parse.outputs.sentiment) }}`;
+            const reply = ${{ toJSON(steps.parse.outputs.reply) }};
+            const body = `**Sentiment:** \`${sentiment}\`\n\n${reply}`;
+            await github.rest.issues.createComment({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              issue_number,
+              body
+            });
