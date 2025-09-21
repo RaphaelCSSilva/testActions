@@ -1,4 +1,4 @@
-name: Friendly AI reply to comments (with GitHub MCP)
+name: Friendly AI reply to comments (MCP always on)
 
 on:
   issue_comment:
@@ -16,24 +16,53 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Draft a natural reply with GitHub Models (MCP enabled)
+      - name: Prepare ultra-lean prompt files (truncate input)
+        run: |
+          mkdir -p .github/prompts
+          # Minimal system prompt
+          cat > .github/prompts/system.txt <<'SYS'
+          Reply in ≤40 words. Output ONLY the reply text.
+          SYS
+                    # Keep the comment tiny to leave headroom under the 8k cap
+                    printf "%s" "${{ github.event.comment.body }}" | head -c 1200 > .github/prompts/comment.txt
+                    # Minimal structured prompt (forces non-legacy format)
+                    cat > .github/prompts/reply.prompt.yml <<'PR'
+          messages:
+            - role: system
+              content: "{{system}}"
+            - role: user
+              content: |
+                Comment by @{{author}} on "{{title}}":
+                ---
+                {{comment}}
+                ---
+                Repo: {{repo}}
+          model: openai/gpt-4o-mini
+          PR
+
+      - name: Draft reply (MCP enabled)
         id: ai
         uses: actions/ai-inference@v2
         env:
-          GITHUB_TOOLSETS: repos,gists # only expose Repos + Gists tools to MCP
+          # Ask the hosted MCP server to advertise only these toolsets (may be partially honored)
+          GITHUB_TOOLSETS: repos,gists
+          GITHUB_DYNAMIC_TOOLSETS: 1
         with:
           enable-github-mcp: true
+          # Inference token (can be GITHUB_TOKEN); MCP requires a PAT
           token: ${{ secrets.GITHUB_TOKEN }}
           github-mcp-token: ${{ secrets.GH_MCP_PAT }}
-          system-prompt: >
-            You are a helpful, concise maintainer assistant. Reply in ≤60 words.
-            Output ONLY the reply text.
-          prompt: |
-            Comment by @${{ github.event.comment.user.login }} on "${{ github.event.issue.title }}":
-            ---
-            ${{ github.event.comment.body }}
-            ---
-            Repo: ${{ github.repository }}
+          # Keep completion short to save room
+          max-tokens: 80
+          system-prompt-file: .github/prompts/system.txt
+          prompt-file: .github/prompts/reply.prompt.yml
+          input: |
+            author: ${{ github.event.comment.user.login }}
+            title: ${{ github.event.issue.title }}
+            repo: ${{ github.repository }}
+            system: ./.github/prompts/system.txt
+          file_input: |
+            comment: .github/prompts/comment.txt
 
       - name: Post reply
         uses: actions/github-script@v7
