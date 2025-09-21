@@ -23,7 +23,7 @@ jobs:
           # model: openai/gpt-4o-mini
           system-prompt: >
             You are a helpful, concise maintainer assistant.
-            Read the user's comment and write a brief, friendly reply (max 60 words)
+            Read the user's comment and write a friendly reply
             that matches their tone and moves the conversation forward.
             Do not include any preamble or labels—output ONLY the reply text.
           prompt: |
