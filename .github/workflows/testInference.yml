@@ -1,4 +1,4 @@
-name: Friendly AI reply to comments (MCP always on)
+name: Friendly AI reply to comments (MCP always on, minimal scopes)
 
 on:
   issue_comment:
@@ -16,16 +16,14 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Prepare ultra-lean prompt files (truncate input)
+      - name: Prepare tiny prompt input
         run: |
           mkdir -p .github/prompts
-          # Minimal system prompt
           cat > .github/prompts/system.txt <<'SYS'
           Reply in ≤40 words. Output ONLY the reply text.
           SYS
-                    # Keep the comment tiny to leave headroom under the 8k cap
-                    printf "%s" "${{ github.event.comment.body }}" | head -c 1200 > .github/prompts/comment.txt
-                    # Minimal structured prompt (forces non-legacy format)
+                    # Trim comment to leave headroom under GitHub Models' ~8k input cap
+                    printf "%s" "${{ github.event.comment.body }}" | head -c 800 > .github/prompts/comment.txt
                     cat > .github/prompts/reply.prompt.yml <<'PR'
           messages:
             - role: system
@@ -40,19 +38,23 @@ jobs:
           model: openai/gpt-4o-mini
           PR
 
-      - name: Draft reply (MCP enabled)
+      - name: Draft reply (MCP enabled, minimal PAT)
         id: ai
         uses: actions/ai-inference@v2
         env:
-          # Ask the hosted MCP server to advertise only these toolsets (may be partially honored)
+          # Ask server to keep catalog small (hosted server may only partially honor these)
           GITHUB_TOOLSETS: repos,gists
           GITHUB_DYNAMIC_TOOLSETS: 1
+          # While testing, you can force read-only surfaces server-side if supported:
+          GITHUB_READ_ONLY: 1
         with:
           enable-github-mcp: true
-          # Inference token (can be GITHUB_TOKEN); MCP requires a PAT
+          # Normal inference token (GITHUB_TOKEN OK)
           token: ${{ secrets.GITHUB_TOKEN }}
-          github-mcp-token: ${{ secrets.GH_MCP_PAT }}
-          # Keep completion short to save room
+          # IMPORTANT: use a *minimal-scope* fine-grained PAT here:
+          #  - Repository: Contents (Read & write) for this repo only
+          #  - Account: Gists (Read & write)
+          github-mcp-token: ${{ secrets.GH_MCP_PAT_MIN }}
           max-tokens: 80
           system-prompt-file: .github/prompts/system.txt
           prompt-file: .github/prompts/reply.prompt.yml
