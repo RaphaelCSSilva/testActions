@@ -1,4 +1,4 @@
-name: Friendly AI reply to comments
+name: Friendly AI reply to comments (with GitHub MCP)
 
 on:
   issue_comment:
@@ -6,26 +6,32 @@ on:
 
 permissions:
   contents: read
-  issues: write          # needed to post a comment on Issues
-  pull-requests: write   # needed to post a comment on PRs
-  models: read           # required by actions/ai-inference
+  issues: write
+  pull-requests: write
+  models: read
 
 jobs:
   reply:
-    if: ${{ github.actor != 'github-actions[bot]' }} # avoid loops
+    if: ${{ github.actor != 'github-actions[bot]' }}
     runs-on: ubuntu-latest
+
     steps:
-      - name: Draft a natural reply with GitHub Models
+      - name: Draft a natural reply with GitHub Models (MCP enabled)
         id: ai
         uses: actions/ai-inference@v2
         with:
-          # Optional: choose a smaller model for speed/cost
+          # Optional: pick a faster model
           # model: openai/gpt-4o-mini
+          enable-github-mcp: true
+          # Use the default workflow token for normal GitHub API reads
+          token: ${{ secrets.GITHUB_TOKEN }}
+          # Separate user PAT for MCP tool calls (set this in repo/org secrets)
+          github-mcp-token: ${{ secrets.GH_MCP_PAT }}
           system-prompt: >
             You are a helpful, concise maintainer assistant.
-            Read the user's comment and write a friendly reply
+            Read the user's comment and write a brief, friendly reply (max 60 words)
             that matches their tone and moves the conversation forward.
-            Do not include any preamble or labels—output ONLY the reply text.
+            Output ONLY the reply text (no labels, no code fences).
           prompt: |
             Comment by @${{ github.event.comment.user.login }} on "${{ github.event.issue.title }}":
             ---
@@ -38,7 +44,6 @@ jobs:
         with:
           script: |
             const issue_number = context.payload.issue.number;
-            // Use toJSON to safely pass multiline/model text
             const reply = ${{ toJSON(steps.ai.outputs.response) }};
             await github.rest.issues.createComment({
               owner: context.repo.owner,
