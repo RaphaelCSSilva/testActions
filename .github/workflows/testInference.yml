@@ -1,216 +1,89 @@
-name: Friendly AI reply to comments (MCP via tiny bridge)
+name: Similar Issues via AI MCP
 
 on:
-  issue_comment:
-    types: [created]
-
-permissions:
-  contents: read
-  issues: write
-  pull-requests: write
-  models: read
+  issues:
+    types: [opened]
 
 jobs:
-  reply:
-    if: ${{ github.actor != 'github-actions[bot]' }}
+  find-similar:
+    permissions:
+      contents: read
+      issues: write
+      models: read
     runs-on: ubuntu-latest
-
     steps:
-      - name: Setup Node
-        uses: actions/setup-node@v4
-        with:
-          node-version: 20
+      - name: Check out repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
 
-      - name: Install MCP client SDK
-        run: npm install --no-audit --no-fund @modelcontextprotocol/sdk@latest
-
-      - name: Create tiny MCP bridge
-        run: |
-          cat > mcp-bridge.mjs <<'JS'
-          import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-          import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
-          import fs from "node:fs";
-
-          const {
-            GH_MCP_PAT,                // repo/org secret with PAT
-            GITHUB_TOKEN,              // default Actions token (for Models API)
-            OWNER, REPO_NAME, REPO, BRANCH,
-            COMMENT_BODY, AUTHOR, TITLE,
-            MODEL = "openai/gpt-4o-mini"
-          } = process.env;
-
-          // Start GitHub MCP server (repos + gists only), feed PAT as env
-          const transport = new StdioClientTransport({
-            command: "docker",
-            args: [
-              "run","-i","--rm",
-              "-e", `GITHUB_PERSONAL_ACCESS_TOKEN=${GH_MCP_PAT}`,
-              "-e", `GITHUB_TOKEN=${GH_MCP_PAT}`,
-              "-e", "GITHUB_TOOLSETS=repos,gists",
-              "ghcr.io/github/github-mcp-server:latest",
-              "stdio",
-              "--toolsets","repos,gists",
-              "--dynamic-toolsets=false"
-            ]
-          });
-
-          const client = new Client({ name: "actions-mcp-bridge", version: "1.0.0" });
-          await client.connect(transport);
-
-          // Only expose two tool schemas to the model (keeps prompt tiny)
-          // Tool names match the GitHub MCP server (no namespace).
-          const tools = [
-            {
-              type: "function",
-              function: {
-                name: "create_or_update_file",
-                description: "Create or update a file in a repository.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    owner: { type: "string" },
-                    repo: { type: "string" },
-                    path: { type: "string" },
-                    message: { type: "string" },
-                    content: { type: "string", description: "Base64-encoded file content" },
-                    branch: { type: "string" },
-                    sha: { type: "string", nullable: true }
-                  },
-                  required: ["owner","repo","path","message","content","branch"]
-                }
-              }
-            },
-            {
-              type: "function",
-              function: {
-                name: "create_gist",
-                description: "Create a new GitHub gist.",
-                parameters: {
-                  type: "object",
-                  properties: {
-                    description: { type: "string" },
-                    files: {
-                      type: "object",
-                      additionalProperties: {
-                        type: "object",
-                        properties: { content: { type: "string" } },
-                        required: ["content"]
-                      }
-                    },
-                    public: { type: "boolean" }
-                  },
-                  required: ["files"]
-                }
-              }
-            }
-          ];
-
-          // Tiny prompt
-          const system = "Reply in ≤40 words. Output ONLY the reply text. You may call tools if needed.";
-          const user = [
-            `Comment by @${AUTHOR} on "${TITLE}":`,
-            "---",
-            (COMMENT_BODY || "").slice(0, 800),
-            "---",
-            `Repo: ${REPO}`,
-            `Branch: ${BRANCH}`
-          ].join("\n");
-
-          const headers = {
-            "Authorization": `Bearer ${GITHUB_TOKEN}`,
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-            "X-GitHub-Api-Version": "2022-11-28"
-          };
-          const endpoint = "https://models.github.ai/inference/chat/completions";
-
-          // Round 1 (model may issue tool_calls)
-          const r1 = await fetch(endpoint, {
-            method: "POST",
-            headers,
-            body: JSON.stringify({
-              model: MODEL,
-              max_tokens: 80,
-              tool_choice: "auto",
-              tools,
-              messages: [
-                { role: "system", content: system },
-                { role: "user", content: user }
-              ]
-            })
-          });
-          const d1 = await r1.json();
-          const m1 = d1.choices?.[0]?.message ?? {};
-          let replyText = m1.content || "";
-
-          // If tools requested, execute via MCP and do a second round
-          if (m1.tool_calls && m1.tool_calls.length) {
-            const toolMsgs = [];
-            for (const tc of m1.tool_calls) {
-              const name = tc.function?.name;
-              let args = {};
-              try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
-              // Safe defaults for repo ops
-              if (name === "create_or_update_file") {
-                args.owner ??= OWNER;
-                args.repo ??= REPO_NAME;
-                args.branch ??= BRANCH;
-                args.message ??= "chore: bot update";
-                args.path ??= "testFile.txt";
-                args.content ??= ""; // Expect base64 from the model if it sets content
-              }
-              const result = await client.callTool({ name, arguments: args });
-              const text = result?.content?.[0]?.text ?? JSON.stringify(result);
-              toolMsgs.push({ role: "tool", tool_call_id: tc.id, name, content: text });
-            }
-
-            const r2 = await fetch(endpoint, {
-              method: "POST",
-              headers,
-              body: JSON.stringify({
-                model: MODEL,
-                max_tokens: 80,
-                tools,
-                messages: [
-                  { role: "system", content: system },
-                  { role: "user", content: user },
-                  { role: "assistant", content: "", tool_calls: m1.tool_calls },
-                  ...toolMsgs
-                ]
-              })
-            });
-            const d2 = await r2.json();
-            replyText = d2.choices?.[0]?.message?.content || replyText || "Done.";
-          }
-
-          // Output for next step
-          fs.appendFileSync(process.env.GITHUB_OUTPUT, `reply<<EOF\n${replyText}\nEOF\n`);
-          JS
-
-      - name: Run MCP bridge and get reply
-        id: bridge
-        env:
-          GH_MCP_PAT: ${{ secrets.GH_MCP_PAT }} # PAT with at least: repo (and gist if using gists)
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }} # models:read is enough
-          OWNER: ${{ github.repository_owner }}
-          REPO_NAME: ${{ github.event.repository.name }}
-          REPO: ${{ github.repository }}
-          BRANCH: ${{ github.ref_name }}
-          AUTHOR: ${{ github.event.comment.user.login }}
-          TITLE: ${{ github.event.issue.title }}
-          COMMENT_BODY: ${{ github.event.comment.body }}
-          MODEL: openai/gpt-4o-mini
-        run: node mcp-bridge.mjs
-
-      - name: Post reply
-        uses: actions/github-script@v7
+      - name: Prepare prompt variables
+        id: prepare_input
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
         with:
           script: |
-            const issue_number = context.payload.issue.number;
-            const reply = process.env.reply || `${{ steps.bridge.outputs.reply }}`;
+            const issue = context.payload.issue || {};
+            const title = issue.title || '';
+            const body = issue.body || '';
+            const indent = '      ';
+            // Indent subsequent lines so YAML block scalar indentation remains valid
+            const bodyIndented = body.replace(/\n/g, '\n' + indent);
+            core.setOutput('issue_title_json', JSON.stringify(title));
+            core.setOutput('issue_body_indented_json', JSON.stringify(bodyIndented));
+
+      - name: Find similar issues with AI (MCP)
+        id: inference
+        uses: actions/ai-inference@a1c11829223a786afe3b5663db904a3aa1eac3a2 # v2.0.1
+        with:
+          prompt-file: ./.github/prompts/similar_issues.prompt.yml
+          input: |
+            issue_title: ${{ steps.prepare_input.outputs.issue_title_json }}
+            issue_body: ${{ steps.prepare_input.outputs.issue_body_indented_json }}
+            repository: ${{ github.repository }}
+          enable-github-mcp: true
+          # Inference token can use GITHUB_TOKEN. MCP specifically requires a PAT.
+          token: ${{ secrets.GITHUB_TOKEN }}
+          github-mcp-token: ${{ secrets.GH_MCP_PAT }}
+          max-tokens: 8000
+
+      - name: Prepare comment body
+        id: prepare
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        env:
+          AI_RESPONSE: ${{ steps.inference.outputs.response }}
+        with:
+          script: |
+            let data;
+            try {
+              data = JSON.parse(process.env.AI_RESPONSE || '{}');
+            } catch (e) {
+              core.setOutput('has_matches', 'false');
+              return;
+            }
+            const matches = Array.isArray(data.matches) ? data.matches : [];
+            if (!matches.length) {
+              core.setOutput('has_matches', 'false');
+              return;
+            }
+            const lines = [];
+            lines.push('I found similar issues that might help:');
+            for (const m of matches.slice(0, 3)) {
+              const num = m.number != null ? `#${m.number}` : '';
+              const title = m.title || 'Untitled';
+              const url = m.url || '';
+              const score = typeof m.similarity_score === 'number' ? ` (similarity: ${m.similarity_score.toFixed(2)})` : '';
+              lines.push(`- ${url}${score}`.trim());
+            }
+            core.setOutput('has_matches', 'true');
+            core.setOutput('comment_body', lines.join('\n'));
+
+      - name: Comment similar issues
+        if: steps.prepare.outputs.has_matches == 'true'
+        uses: actions/github-script@ed597411d8f924073f98dfc5c65a23a2325f34cd # v8.0.0
+        with:
+          script: |
+            const body = ${{ toJson(steps.prepare.outputs.comment_body) }};
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              issue_number,
-              body: reply
+              issue_number: context.payload.issue.number,
+              body
             });
