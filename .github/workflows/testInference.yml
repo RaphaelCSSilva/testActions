@@ -1,0 +1,68 @@
+name: Sentiment reply to issue comments
+
+on:
+  issue_comment:
+    types: [created]
+
+permissions:
+  contents: read
+  issues: write         # needed to post a comment
+  pull-requests: write  # replies on PRs
+  models: read          # required by actions/ai-inference
+
+jobs:
+  respond:
+    if: ${{ github.actor != 'github-actions[bot]' }} # avoid loops
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Analyze sentiment with GitHub Models
+        id: ai
+        uses: actions/ai-inference@v2
+        with:
+          # Default model is openai/gpt-4o; override via 'model:' if you like
+          # model: openai/gpt-4o-mini
+          system-prompt: >
+            You are a precise sentiment analyst and helpful maintainer assistant.
+            Read the user's comment and do two things:
+            1) Classify sentiment as one of: positive | neutral | negative.
+            2) Write a brief, friendly, project-appropriate reply (max 60 words)
+               that acknowledges their tone and moves the conversation forward.
+            Output EXACTLY this JSON:
+            {"sentiment":"<positive|neutral|negative>", "reply":"<one short reply>"}
+          prompt: |
+            The comment text is:
+            ---
+            ${{ github.event.comment.body }}
+            ---
+            Context:
+            - Issue/PR title: "${{ github.event.issue.title }}"
+            - Author: "${{ github.event.comment.user.login }}"
+            - Repo: "${{ github.repository }}"
+            Remember: JSON only, no markdown, no extra text.
+          max-tokens: 250
+
+      - name: Parse AI response
+        id: parse
+        run: |
+          echo '${{ steps.ai.outputs.response }}' > ai.json
+          # Extract fields safely
+          sentiment=$(jq -r '.sentiment // "neutral"' ai.json)
+          reply=$(jq -r '.reply // ""' ai.json)
+          echo "sentiment=$sentiment" >> "$GITHUB_OUTPUT"
+          echo "reply<<EOF" >> "$GITHUB_OUTPUT"
+          echo "$reply" >> "$GITHUB_OUTPUT"
+          echo "EOF" >> "$GITHUB_OUTPUT"
+
+      - name: Post reply
+        uses: actions/github-script@v7
+        with:
+            script: |
+              const issue_number = context.payload.issue.number;
+              const body = `**Sentiment:** \`${{ steps.parse.outputs.sentiment }}\`\n\n${{ toJSON(steps.parse.outputs.reply) }}`;
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body
+              });
