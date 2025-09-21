@@ -1,4 +1,4 @@
-name: Friendly AI reply to comments (MCP always on, minimal scopes)
+name: Friendly AI reply to comments (local MCP bridge)
 
 on:
   issue_comment:
@@ -16,62 +16,162 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
-      - name: Prepare tiny prompt input
-        run: |
-          mkdir -p .github/prompts
-          cat > .github/prompts/system.txt <<'SYS'
-          Reply in ≤40 words. Output ONLY the reply text.
-          SYS
-                    # Trim comment to leave headroom under GitHub Models' ~8k input cap
-                    printf "%s" "${{ github.event.comment.body }}" | head -c 800 > .github/prompts/comment.txt
-                    cat > .github/prompts/reply.prompt.yml <<'PR'
-          messages:
-            - role: system
-              content: "{{system}}"
-            - role: user
-              content: |
-                Comment by @{{author}} on "{{title}}":
-                ---
-                {{comment}}
-                ---
-                Repo: {{repo}}
-          model: openai/gpt-4o-mini
-          PR
-
-      - name: Draft reply (MCP enabled, minimal PAT)
-        id: ai
-        uses: actions/ai-inference@v2
-        env:
-          # Ask server to keep catalog small (hosted server may only partially honor these)
-          GITHUB_TOOLSETS: repos,gists
-          GITHUB_DYNAMIC_TOOLSETS: 1
-          # While testing, you can force read-only surfaces server-side if supported:
-          GITHUB_READ_ONLY: 1
+      - name: Prepare Node + deps
+        uses: actions/setup-node@v4
         with:
-          enable-github-mcp: true
-          # Normal inference token (GITHUB_TOKEN OK)
-          token: ${{ secrets.GITHUB_TOKEN }}
-          # IMPORTANT: use a *minimal-scope* fine-grained PAT here:
-          #  - Repository: Contents (Read & write) for this repo only
-          #  - Account: Gists (Read & write)
-          github-mcp-token: ${{ secrets.GH_MCP_PAT_MIN }}
-          max-tokens: 80
-          system-prompt-file: .github/prompts/system.txt
-          prompt-file: .github/prompts/reply.prompt.yml
-          input: |
-            author: ${{ github.event.comment.user.login }}
-            title: ${{ github.event.issue.title }}
-            repo: ${{ github.repository }}
-            system: ./.github/prompts/system.txt
-          file_input: |
-            comment: .github/prompts/comment.txt
+          node-version: '20'
+
+      - name: Install MCP client SDK
+        run: npm install --no-audit --no-fund @modelcontextprotocol/sdk@latest
+
+      - name: Write bridge script
+        shell: bash
+        run: |
+          cat > mcp-bridge.mjs <<'JS'
+          import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+          import { StdioClientTransport } from "@modelcontextprotocol/sdk/client/stdio.js";
+          import fs from "node:fs";
+
+          const {
+            GH_MCP_PAT, GITHUB_TOKEN,
+            OWNER, REPO_NAME, REPO, BRANCH,
+            COMMENT_BODY, AUTHOR, TITLE,
+            MODEL = "openai/gpt-4o-mini"
+          } = process.env;
+
+          // 1) Start GitHub MCP server (restricted to repos+gists) via Docker and connect over stdio
+          const transport = new StdioClientTransport({
+            command: "docker",
+            args: [
+              "run","-i","--rm",
+              "-e", `GITHUB_PERSONAL_ACCESS_TOKEN=${GH_MCP_PAT}`,
+              "-e", "GITHUB_TOOLSETS=repos,gists",
+              "-e", "GITHUB_DYNAMIC_TOOLSETS=0",
+              "ghcr.io/github/github-mcp-server:latest"
+            ]
+          });
+
+          const client = new Client({ name: "actions-mcp-bridge", version: "1.0.0" });
+          await client.connect(transport);
+
+          // 2) List only the tools we want to expose to the model
+          const wanted = new Set(["repositories.create_or_update_file","gists.create"]);
+          const list = await client.listTools();
+          const tools = list.tools
+            .filter(t => wanted.has(t.name))
+            .map(t => ({
+              type: "function",
+              function: {
+                name: t.name,
+                description: t.description ?? "",
+                // MCP already gives JSON Schema for inputs
+                parameters: t.inputSchema ?? { type: "object", additionalProperties: true }
+              }
+            }));
+
+          // 3) Build a tiny prompt
+          const system = "Reply in ≤40 words. Output ONLY the reply text. You may call tools if needed.";
+          const user = [
+            `Comment by @${AUTHOR} on "${TITLE}":`,
+            "---",
+            (COMMENT_BODY || "").slice(0, 800),
+            "---",
+            `Repo: ${REPO}`,
+            `Branch: ${BRANCH}`
+          ].join("\n");
+
+          const headers = {
+            "Authorization": `Bearer ${GITHUB_TOKEN}`,
+            "Content-Type": "application/json",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28"
+          };
+
+          const endpoint = "https://models.github.ai/inference/chat/completions";
+
+          // 4) First round (model may issue tool_calls)
+          const r1 = await fetch(endpoint, {
+            method: "POST", headers,
+            body: JSON.stringify({
+              model: MODEL,
+              max_tokens: 80,
+              tool_choice: "auto",
+              tools,
+              messages: [
+                { role: "system", content: system },
+                { role: "user", content: user }
+              ]
+            })
+          });
+          const d1 = await r1.json();
+          const m1 = d1.choices?.[0]?.message ?? {};
+          let replyText = m1.content || "";
+
+          // 5) If tools requested, execute via MCP and do a second round
+          if (m1.tool_calls && m1.tool_calls.length) {
+            const toolMsgs = [];
+            for (const tc of m1.tool_calls) {
+              const name = tc.function?.name;
+              let args = {};
+              try { args = JSON.parse(tc.function?.arguments || "{}"); } catch {}
+              // Inject defaults for repo ops
+              if (name === "repositories.create_or_update_file") {
+                args.owner ??= OWNER;
+                args.repo ??= REPO_NAME;
+                args.branch ??= BRANCH;
+                args.message ??= "chore: bot update";
+                args.path ??= "testFile.txt";
+                // If content not provided, keep empty string rather than undefined
+                args.content ??= "";
+              }
+              const result = await client.callTool({ name, arguments: args });
+              const text = result?.content?.[0]?.text ?? JSON.stringify(result);
+              toolMsgs.push({ role: "tool", tool_call_id: tc.id, name, content: text });
+            }
+
+            const r2 = await fetch(endpoint, {
+              method: "POST", headers,
+              body: JSON.stringify({
+                model: MODEL,
+                max_tokens: 80,
+                tools,
+                messages: [
+                  { role: "system", content: system },
+                  { role: "user", content: user },
+                  { role: "assistant", content: "", tool_calls: m1.tool_calls },
+                  ...toolMsgs
+                ]
+              })
+            });
+            const d2 = await r2.json();
+            replyText = d2.choices?.[0]?.message?.content || replyText || "Done.";
+          }
+
+          // 6) Output reply for the next step
+          fs.appendFileSync(process.env.GITHUB_OUTPUT, `reply<<EOF\n${replyText}\nEOF\n`);
+          JS
+
+      - name: Run bridge (MCP + Models)
+        id: ai
+        env:
+          GH_MCP_PAT: ${{ secrets.GH_MCP_PAT }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          OWNER: ${{ github.repository_owner }}
+          REPO_NAME: ${{ github.event.repository.name }}
+          REPO: ${{ github.repository }}
+          BRANCH: ${{ github.event.repository.default_branch }}
+          AUTHOR: ${{ github.event.comment.user.login }}
+          TITLE: ${{ github.event.issue.title }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          MODEL: openai/gpt-4o-mini
+        run: node mcp-bridge.mjs
 
       - name: Post reply
         uses: actions/github-script@v7
         with:
           script: |
             const issue_number = context.payload.issue.number;
-            const reply = ${{ toJSON(steps.ai.outputs.response) }};
+            const reply = ${{ toJSON(steps.ai.outputs.reply) }};
             await github.rest.issues.createComment({
               owner: context.repo.owner,
               repo: context.repo.repo,
