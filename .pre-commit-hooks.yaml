@@ -1,0 +1,5 @@
+- id: my-hook
+  name: my-hook
+  language: system
+  entry: ./run.sh
+  types: [python]
